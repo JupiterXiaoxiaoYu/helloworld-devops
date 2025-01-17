@@ -14,11 +14,11 @@ pipeline {
                     tty: true
                     resources:
                       requests:
-                        memory: "2Gi"
-                        cpu: "1000m"
+                        memory: "1Gi"
+                        cpu: "500m"
                       limits:
-                        memory: "4Gi"
-                        cpu: "2000m"
+                        memory: "1Gi"
+                        cpu: "500m"
                     volumeMounts:
                     - name: cargo-cache
                       mountPath: /home/jenkins/.cargo
@@ -33,12 +33,27 @@ pipeline {
                     volumeMounts:
                     - name: npm-cache
                       mountPath: /root/.npm
-                  - name: kaniko
-                    image: gcr.io/kaniko-project/executor:latest
+                  - name: kubectl
+                    image: bitnami/kubectl:latest
                     imagePullPolicy: IfNotPresent
                     command:
-                    - /busybox/cat
+                    - cat
                     tty: true
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "512Mi"
+                        cpu: "250m"
+                  - name: jnlp
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "512Mi"
+                        cpu: "250m"
                   volumes:
                   - name: cargo-cache
                     persistentVolumeClaim:
@@ -147,26 +162,16 @@ pipeline {
             }
         }
 
-        stage('Build Docker Image') {
-            steps {
-                container('kaniko') {
-                    sh """
-                        /kaniko/executor \
-                            --context=. \
-                            --dockerfile=./deploy/service.docker \
-                            --destination=${FULL_IMAGE_NAME} \
-                            --insecure \
-                            --skip-tls-verify
-                    """
-                }
-            }
-        }
-
         stage('Deploy to K8s') {
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
             steps {
-                script {
-                    // 创建命名空间
+                container('kubectl') {
                     sh """
+                        set -x
+                        
+                        echo "Creating namespace..."
                         kubectl create namespace ${NAMESPACE}-${APP_NAME} --dry-run=client -o yaml | kubectl apply -f -
                     """
 
@@ -192,8 +197,8 @@ pipeline {
                             --from-file=pkg/ \
                             -n ${NAMESPACE}-${APP_NAME} \
                             --dry-run=client -o yaml | kubectl apply -f -
-
-                        # 部署主应用
+                        
+                        echo "Deploying application..."
                         cat <<EOF | kubectl apply -f -
                         apiVersion: apps/v1
                         kind: Deployment
@@ -239,6 +244,11 @@ pipeline {
                           - port: 3000
                             targetPort: 3000
                         EOF
+                        
+                        echo "Checking deployment status..."
+                        kubectl get deployments -n ${NAMESPACE}-${APP_NAME}
+                        
+                        echo "Deployment complete!"
                     """
                 }
             }
