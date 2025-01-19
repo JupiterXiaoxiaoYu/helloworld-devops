@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-pre-pull
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: image-pre-pull
+  template:
+    metadata:
+      labels:
+        name: image-pre-pull
+    spec:
+      initContainers:
+      - name: pull-merkleservice
+        image: docker.io/sinka2022/zkwasm-merkleservice:latest  # 使用完整的镜像路径
+        command: ["echo", "Pulled merkleservice image"]
+        imagePullPolicy: Always
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      - name: pull-mongodb
+        image: docker.io/library/mongo:latest
+        command: ["echo", "Pulled mongodb image"]
+        imagePullPolicy: Always
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      - name: pull-redis
+        image: docker.io/library/redis:latest
+        command: ["echo", "Pulled redis image"]
+        imagePullPolicy: Always
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
