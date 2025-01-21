@@ -10,26 +10,13 @@ pipeline {
                 spec:
                   serviceAccountName: jenkins-deployer
                   containers:
-                  - name: rust
-                    image: rustlang/rust:nightly-bullseye
-                    imagePullPolicy: IfNotPresent
-                    command:
-                    - cat
-                    tty: true
+                  - name: docker
+                    image: docker:dind
+                    securityContext:
+                      privileged: true
                     volumeMounts:
-                    - name: build-cache
-                      mountPath: /shared-cache
-                      subPath: cargo
-                  - name: node
-                    image: node:18
-                    imagePullPolicy: IfNotPresent
-                    command:
-                    - cat
-                    tty: true
-                    volumeMounts:
-                    - name: build-cache
-                      mountPath: /root/.npm
-                      subPath: npm
+                      - name: docker-sock
+                        mountPath: /var/run/docker.sock
                   - name: kubectl
                     image: alpine/k8s:1.24.13
                     imagePullPolicy: IfNotPresent
@@ -37,23 +24,20 @@ pipeline {
                     - cat
                     tty: true
                   volumes:
-                  - name: build-cache
-                    persistentVolumeClaim:
-                      claimName: shared-build-cache
+                  - name: docker-sock
+                    hostPath:
+                      path: /var/run/docker.sock
             '''
-            defaultContainer 'rust'
+            defaultContainer 'kubectl'
         }
     }
 
     environment {
-        DOCKER_REGISTRY = "${env.DOCKER_REGISTRY}"
-        CARGO_HOME = "/usr/local/cargo"
-        RUSTUP_HOME = "/usr/local/rustup"
         IMAGE_NAME = 'zkwasm-server'
         IMAGE_TAG = "${BUILD_NUMBER}"
         CUSTOMER_ID = "${params.CUSTOMER_ID}"
         NAMESPACE = "zkwasm-${CUSTOMER_ID}"
-        FULL_IMAGE_NAME = "${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+        FULL_IMAGE_NAME = "${IMAGE_NAME}:${IMAGE_TAG}"
         GIT_URL = "${params.GIT_URL}"
         APP_NAME = "${params.APP_NAME}"
         MINIROLLUP_CHARTS_REPO = "${params.MINIROLLUP_CHARTS_REPO}"
@@ -61,6 +45,20 @@ pipeline {
     }
 
     stages {
+
+        stage('Debug Docker') {
+            steps {
+                container('docker') {
+                    sh '''
+                        # 检查 Docker 环境
+                        ls -l /var/run/docker.sock
+                        docker info
+                        docker ps
+                    '''
+                }
+            }
+        }
+
         stage('Deploy to K8s') {
             options {
                 timeout(time: 15, unit: 'MINUTES')
@@ -266,186 +264,65 @@ pipeline {
             }
         }
 
-        stage('Parallel Setup') {
-            parallel {
-                stage('Setup Rust Environment') {
-                    steps {
-                        sh '''
-                            # 删除 rust-toolchain 文件
-                            rm -f rust-toolchain
-                            
-                            # 设置 Rust 环境变量
-                            export RUSTUP_HOME=/usr/local/rustup
-                            export CARGO_HOME=/usr/local/cargo
-                            export PATH="/usr/local/cargo/bin:$PATH"
-                            
-                            # 创建并导出环境变量
-                            mkdir -p ${CARGO_HOME}
-                            echo 'export PATH="$CARGO_HOME/bin:$PATH"' > ${CARGO_HOME}/env
-                            chmod +x ${CARGO_HOME}/env
-                            . ${CARGO_HOME}/env
-                            
-                            # 检查 Rust 环境
-                            echo "Checking Rust environment..."
-                            echo "PATH=$PATH"
-                            echo "RUSTUP_HOME=$RUSTUP_HOME"
-                            echo "CARGO_HOME=$CARGO_HOME"
-                            
-                            # 检查必要工具是否已安装
-                            NEED_TOOLS=false
-                            
-                            # 检查基础工具
-                            for tool in binaryen; do
-                                if ! dpkg -l | grep -q "^ii  $tool "; then
-                                    echo "$tool needs to be installed"
-                                    NEED_TOOLS=true
-                                    break
-                                fi
-                            done
-                            
-                            # 如果需要安装基础工具
-                            if [ "$NEED_TOOLS" = true ]; then
-                                echo "Installing basic tools..."
-                                apt-get update && apt-get install -y --no-install-recommends \
-                                    binaryen \
-                                    && rm -rf /var/lib/apt/lists/*
-                            else
-                                echo "Basic tools already installed, skipping..."
-                            fi
-                            
-                            # 检查 wasm-pack
-                            if ! command -v wasm-pack >/dev/null; then
-                                echo "Installing wasm-pack..."
-                                # 使用系统自带的 cargo 直接安装
-                                /usr/local/cargo/bin/cargo install wasm-pack --locked
-                            else
-                                echo "wasm-pack already installed, checking version..."
-                                wasm-pack --version
-                            fi
-                            
-                            # 验证工具链
-                            echo "Verifying toolchain..."
-                            rustc --version
-                            cargo --version
-                            wasm-opt --version
-                            rustup target list | grep wasm32
-                        '''
-                    }
-                }
-                
-                stage('Setup Node Environment') {
-                    steps {
-                        container('node') {
-                            sh '''
-                                # 预安装全局依赖
-                                npm install -g typescript
-                        
-                                if [ -f "package.json" ]; then
-                                    npm ci --verbose
-                                fi
-                            '''
-                        }
-                    }
-                }
-            }
-        }
-
-        stage('Parallel Build') {
-            parallel {
-                stage('Build TypeScript') {
-                    steps {
-                        container('node') {
-                            dir('ts') {
-                                sh '''
-                                    npm ci --verbose
-                                    npx tsc
-                                '''
-                            }
-                        }
-                    }
-                }
-
-                stage('Build Rust') {
-                    steps {
-                        sh '''
-                            . "$CARGO_HOME/env"
-                            wasm-pack build --release --out-name application --out-dir pkg
-                            wasm-opt -Oz -o ts/node_modules/zkwasm-ts-server/src/application/application_bg.wasm pkg/application_bg.wasm
-                            cp pkg/application_bg.wasm.d.ts ts/node_modules/zkwasm-ts-server/src/application/
-                        '''
-                    }
-                }
-            }
-        }
-
-        stage('Archive Artifacts') {
+        stage('Build Image') {
             steps {
-                archiveArtifacts artifacts: 'ts/node_modules/zkwasm-ts-server/src/application/application_bg.wasm', 
-                fingerprint: true, 
-                allowEmptyArchive: false,
-                onlyIfSuccessful: true
-            }
-        }
+                container('docker') {
+                    sh '''
+                        # 创建 Dockerfile
+                        cat <<EOF > Dockerfile
+FROM rustlang/rust:nightly-bullseye as rust-builder
 
-        stage('Test Run') {
-            steps {
-                container('kubectl') {
-                    sh '''
-                        # 获取 merkle service IP
-                        MERKLE_SVC_IP=$(kubectl get svc -n ${NAMESPACE}-${APP_NAME} ${RELEASE_NAME}-merkleservice -o jsonpath='{.spec.clusterIP}')
-                        echo "Merkle service IP: $MERKLE_SVC_IP"
-                        echo "$MERKLE_SVC_IP" > merkle_ip.txt
-                    '''
-                }
-                
-                container('node') {
-                    sh '''
-                        set -e
-                        cd ts
+# 安装 Rust 构建依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    binaryen \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 wasm-pack
+RUN cargo install wasm-pack --locked
+
+# 设置工作目录
+WORKDIR /build
+COPY . .
+
+# 构建 Rust WASM
+RUN wasm-pack build --release --out-name application --out-dir pkg && \
+    wasm-opt -Oz -o ts/node_modules/zkwasm-ts-server/src/application/application_bg.wasm pkg/application_bg.wasm && \
+    cp pkg/application_bg.wasm.d.ts ts/node_modules/zkwasm-ts-server/src/application/
+
+# Node.js 构建阶段
+FROM node:18 as node-builder
+
+WORKDIR /build
+COPY --from=rust-builder /build .
+
+# 安装 TypeScript 和其他依赖
+RUN npm install -g typescript && \
+    cd ts && \
+    npm ci --verbose && \
+    npx tsc
+
+# 最终运行阶段
+FROM node:18-slim
+
+WORKDIR /app
+
+# 只复制需要的文件
+COPY --from=node-builder /build/ts /app
+
+# 设置环境变量
+ENV URI \
+    REDISHOST \
+    MERKLE_SERVER
+
+EXPOSE 3000
+CMD ["node", "src/service.js"]
+EOF
+
+                        # 只构建本地镜像
+                        docker build -t ${FULL_IMAGE_NAME} .
                         
-                        # 读取 merkle service IP
-                        MERKLE_SVC_IP=$(cat ../merkle_ip.txt)
-                        echo "Using Merkle service IP: $MERKLE_SVC_IP"
-                        
-                        # 等待 merkle service 就绪
-                        echo "Waiting for merkle service to be ready..."
-                        for i in $(seq 1 30); do
-                            if curl -s http://$MERKLE_SVC_IP:3030/health > /dev/null 2>&1; then
-                                echo "Merkle service is healthy"
-                                break
-                            fi
-                            if [ $i -eq 30 ]; then
-                                echo "Merkle service is not ready after 30 attempts"
-                                exit 1
-                            fi
-                            echo "Waiting for merkle service... attempt $i/30"
-                            sleep 2
-                        done
-                        
-                        # 设置环境变量
-                        export URI="mongodb://${RELEASE_NAME}-mongodb:27017"
-                        export REDISHOST="${RELEASE_NAME}-redis"
-                        export MERKLE_SERVER="http://$MERKLE_SVC_IP:3030"
-                        
-                        echo "Starting application with environment variables:"
-                        echo "URI=$URI"
-                        echo "REDISHOST=$REDISHOST"
-                        echo "MERKLE_SERVER=$MERKLE_SERVER"
-                        
-                        # 后台运行应用
-                        node src/service.js &
-                        echo $! > .pid
-                        
-                        echo "Waiting for application to start..."
-                        for i in $(seq 1 30); do
-                            if curl -s http://localhost:3000/health > /dev/null; then
-                                echo "Application is healthy"
-                                exit 0
-                            fi
-                            sleep 1
-                        done
-                        echo "Application failed to start"
-                        exit 1
+                        # 保存镜像为 tar 文件（可选）
+                        docker save ${FULL_IMAGE_NAME} > ${IMAGE_NAME}-${IMAGE_TAG}.tar
                     '''
                 }
             }
@@ -455,14 +332,15 @@ pipeline {
             steps {
                 container('kubectl') {
                     sh '''
+                        # 检查命名空间是否存在
+                        if ! kubectl get namespace ${NAMESPACE}-${APP_NAME} >/dev/null 2>&1; then
+                            echo "Creating namespace ${NAMESPACE}-${APP_NAME}..."
+                            kubectl create namespace ${NAMESPACE}-${APP_NAME}
+                        fi
+
                         echo "Creating deployment in namespace ${NAMESPACE}-${APP_NAME}..."
                         
-                        # 获取当前运行的测试 pod 信息
-                        TEST_POD_NAME=$(kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l jenkins/jenkins-jenkins-agent -o jsonpath='{.items[0].metadata.name}')
-                        echo "Found test pod: ${TEST_POD_NAME}"
-                        
                         # 创建部署配置
-                        echo "Creating deployment from test pod..."
                         cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -471,6 +349,7 @@ metadata:
   namespace: ${NAMESPACE}-${APP_NAME}
   labels:
     app: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+    version: ${IMAGE_TAG}
 spec:
   replicas: 1
   selector:
@@ -483,10 +362,8 @@ spec:
     spec:
       containers:
       - name: app
-        image: node:18-slim
-        command: ["node"]
-        args: ["src/service.js"]
-        workingDir: /app
+        image: ${FULL_IMAGE_NAME}
+        imagePullPolicy: Never  # 使用本地镜像
         env:
         - name: URI
           value: "mongodb://${RELEASE_NAME}-mongodb:27017"
@@ -497,82 +374,46 @@ spec:
         ports:
         - containerPort: 3000
           name: http
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: http
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: http
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        volumeMounts:
-        - name: app-files
-          mountPath: /app
-      volumes:
-      - name: app-files
-        emptyDir: {}
-      initContainers:
-      - name: copy-files
-        image: node:18-slim
-        command:
-        - /bin/sh
-        - -c
-        - |
-          echo "Copying files from test pod..."
-          cp -rv /source/ts/. /app/
-          cd /app
-          echo "Installing dependencies..."
-          npm ci --verbose
-        volumeMounts:
-        - name: app-files
-          mountPath: /app
-        - name: test-files
-          mountPath: /source
-      volumes:
-      - name: app-files
-        emptyDir: {}
-      - name: test-files
-        hostPath:
-          path: ${WORKSPACE}
-          type: Directory
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
 EOF
-                        
+
                         echo "Waiting for deployment to be ready..."
                         kubectl rollout status deployment/zkwasm-app-${CUSTOMER_ID}-${APP_NAME} \
-                            -n ${NAMESPACE}-${APP_NAME} --timeout=5m || true
-                        
-                        echo "Final deployment status and logs:"
-                        POD_NAME=$(kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -o jsonpath='{.items[0].metadata.name}')
-                        echo "Pod status:"
-                        kubectl get pod ${POD_NAME} -n ${NAMESPACE}-${APP_NAME}
-                        echo "Init container logs:"
-                        kubectl logs ${POD_NAME} -c copy-files -n ${NAMESPACE}-${APP_NAME} || true
-                        echo "App container logs:"
-                        kubectl logs ${POD_NAME} -c app -n ${NAMESPACE}-${APP_NAME} || true
-                        
-                        # 创建服务
-                        echo "Creating service..."
-                        cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Service
-metadata:
-  name: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
-  namespace: ${NAMESPACE}-${APP_NAME}
-spec:
-  selector:
-    app: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
-  ports:
-  - name: http
-    port: 3000
-    targetPort: http
-EOF
+                            -n ${NAMESPACE}-${APP_NAME} --timeout=5m
                     '''
                 }
             }
+            post {
+                failure {
+                    container('kubectl') {
+                        sh '''
+                            echo "Deployment failed. Collecting debug information..."
+                            
+                            echo "\\nPod Status:"
+                            kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+                            
+                            echo "\\nPod Details:"
+                            kubectl describe pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+                            
+                            echo "\\nPod Logs:"
+                            for pod in $(kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -o name); do
+                                echo "\\nLogs for $pod:"
+                                kubectl logs $pod -n ${NAMESPACE}-${APP_NAME} --all-containers || true
+                            done
+                            
+                            echo "\\nEvents:"
+                            kubectl get events -n ${NAMESPACE}-${APP_NAME} --sort-by=.metadata.creationTimestamp
+                        '''
+                    }
+                }
+            }
         }
+
     }
 }
