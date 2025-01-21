@@ -10,23 +10,61 @@ pipeline {
                 spec:
                   serviceAccountName: jenkins-deployer
                   containers:
-                  - name: docker
-                    image: docker:dind
+                  - name: buildah
+                    image: quay.io/buildah/stable:latest
+                    imagePullPolicy: IfNotPresent
                     securityContext:
                       privileged: true
+                    command:
+                    - cat
+                    tty: true
+                    env:
+                    - name: BUILDAH_ISOLATION
+                      value: chroot
                     volumeMounts:
-                      - name: docker-sock
-                        mountPath: /var/run/docker.sock
+                    - name: build-storage
+                      mountPath: /var/lib/containers
+                    - name: build-cache
+                      mountPath: /cache
                   - name: kubectl
                     image: alpine/k8s:1.24.13
                     imagePullPolicy: IfNotPresent
                     command:
                     - cat
                     tty: true
+                    volumeMounts:
+                    - name: build-cache
+                      mountPath: /cache
+                  - name: ctr
+                    image: rancher/k3s:v1.24.13-k3s1 
+                    imagePullPolicy: IfNotPresent
+                    command:
+                    - cat
+                    tty: true
+                    securityContext:
+                      privileged: true
+                    env:
+                    - name: CONTAINERD_ADDRESS
+                      value: /run/containerd/containerd.sock
+                    - name: CONTAINERD_NAMESPACE
+                      value: k8s.io
+                    volumeMounts:
+                    - name: build-cache
+                      mountPath: /cache
+                    - name: host-containerd-sock
+                      mountPath: /run/containerd/containerd.sock
+                    - name: host-containerd-sock
+                      mountPath: /run/k3s/containerd/containerd.sock
                   volumes:
-                  - name: docker-sock
+                  - name: build-storage
+                    emptyDir: {}
+                  - name: build-cache
+                    persistentVolumeClaim:
+                      claimName: shared-build-cache
+                  - name: host-containerd-sock
                     hostPath:
-                      path: /var/run/docker.sock
+                      path: /run/containerd/containerd.sock
+                      type: Socket
             '''
             defaultContainer 'kubectl'
         }
@@ -37,7 +75,7 @@ pipeline {
         IMAGE_TAG = "${BUILD_NUMBER}"
         CUSTOMER_ID = "${params.CUSTOMER_ID}"
         NAMESPACE = "zkwasm-${CUSTOMER_ID}"
-        FULL_IMAGE_NAME = "${IMAGE_NAME}:${IMAGE_TAG}"
+        FULL_IMAGE_NAME = "${IMAGE_NAME}-${CUSTOMER_ID}-${APP_NAME}"
         GIT_URL = "${params.GIT_URL}"
         APP_NAME = "${params.APP_NAME}"
         MINIROLLUP_CHARTS_REPO = "${params.MINIROLLUP_CHARTS_REPO}"
@@ -45,19 +83,6 @@ pipeline {
     }
 
     stages {
-
-        stage('Debug Docker') {
-            steps {
-                container('docker') {
-                    sh '''
-                        # 检查 Docker 环境
-                        ls -l /var/run/docker.sock
-                        docker info
-                        docker ps
-                    '''
-                }
-            }
-        }
 
         stage('Deploy to K8s') {
             options {
@@ -256,21 +281,44 @@ pipeline {
             }
         }
 
-        stage('Checkout') {
-            steps {
-                cleanWs()
-                git url: '${GIT_URL}',
-                    branch: 'main'
-            }
-        }
 
         stage('Build Image') {
             steps {
-                container('docker') {
+                container('buildah') {
                     sh '''
-                        # 创建 Dockerfile
-                        cat <<EOF > Dockerfile
-FROM rustlang/rust:nightly-bullseye as rust-builder
+                        # 检查缓存目录是否存在已构建的镜像
+                        ls -lh /cache/images/
+                        if [ -f "/cache/images/${FULL_IMAGE_NAME}.tar" ]; then
+                            echo "Found cached image: /cache/images/${FULL_IMAGE_NAME}.tar"
+                            echo "Skipping build stage..."
+                            exit 0
+                        fi
+
+                        echo "No cached image found, proceeding with build..."
+                        # 创建 Containerfile (等同于 Dockerfile)
+                        cat <<EOF > Containerfile
+FROM docker.io/library/node:18 as node-builder
+
+# Install git and configure npm for better network resilience
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm config set fetch-retry-mintimeout 20000 \
+    && npm config set fetch-retry-maxtimeout 120000 \
+    && npm config set fetch-retries 5
+
+# Set work directory and clone repository
+WORKDIR /build
+RUN git clone ${GIT_URL} .
+
+# Install TypeScript and dependencies with retry mechanism
+RUN npm install -g typescript || npm install -g typescript || npm install -g typescript && \
+    cd ts && \
+    rm -rf package-lock.json && \
+    (npm i --verbose || (sleep 10 && npm i --verbose) || (sleep 30 && npm i --verbose))
+
+# Rust 构建阶段
+FROM docker.io/rustlang/rust:nightly-bullseye as rust-builder
 
 # 安装 Rust 构建依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -280,49 +328,51 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 安装 wasm-pack
 RUN cargo install wasm-pack --locked
 
-# 设置工作目录
+# 设置工作目录并复制代码
 WORKDIR /build
-COPY . .
+COPY --from=node-builder /build .
 
 # 构建 Rust WASM
 RUN wasm-pack build --release --out-name application --out-dir pkg && \
     wasm-opt -Oz -o ts/node_modules/zkwasm-ts-server/src/application/application_bg.wasm pkg/application_bg.wasm && \
     cp pkg/application_bg.wasm.d.ts ts/node_modules/zkwasm-ts-server/src/application/
 
-# Node.js 构建阶段
-FROM node:18 as node-builder
-
-WORKDIR /build
-COPY --from=rust-builder /build .
-
-# 安装 TypeScript 和其他依赖
-RUN npm install -g typescript && \
-    cd ts && \
-    npm ci --verbose && \
-    npx tsc
+# 回到 node-builder 完成 TypeScript 编译
+FROM node-builder as ts-builder
+COPY --from=rust-builder /build/pkg ./pkg
+COPY --from=rust-builder /build/ts/node_modules/zkwasm-ts-server/src/application ./ts/node_modules/zkwasm-ts-server/src/application
+RUN cd ts && npx tsc
 
 # 最终运行阶段
-FROM node:18-slim
+FROM docker.io/library/node:18-slim
 
 WORKDIR /app
 
 # 只复制需要的文件
-COPY --from=node-builder /build/ts /app
+COPY --from=ts-builder /build/ts /app
 
 # 设置环境变量
-ENV URI \
-    REDISHOST \
-    MERKLE_SERVER
+ENV URI="" \
+    REDISHOST="" \
+    MERKLE_SERVER=""
 
 EXPOSE 3000
-CMD ["node", "src/service.js"]
+CMD ["node", "src/service.js"] 
 EOF
 
-                        # 只构建本地镜像
-                        docker build -t ${FULL_IMAGE_NAME} .
+                        # 使用 Buildah 构建镜像
+                        buildah bud -t ${FULL_IMAGE_NAME} -f Containerfile .
                         
-                        # 保存镜像为 tar 文件（可选）
-                        docker save ${FULL_IMAGE_NAME} > ${IMAGE_NAME}-${IMAGE_TAG}.tar
+                        # 将镜像保存为 OCI 格式
+                        mkdir -p /cache/images
+                        echo "Saving image to: /cache/images/${FULL_IMAGE_NAME}.tar"
+                
+                        # 使用完整路径和.tar扩展名
+                        buildah push ${FULL_IMAGE_NAME} docker-archive:/cache/images/${FULL_IMAGE_NAME}.tar
+                        
+                        # 验证文件
+                        echo "Saved files:"
+                        ls -lh /cache/images/
                     '''
                 }
             }
@@ -330,62 +380,69 @@ EOF
 
         stage('Deploy') {
             steps {
-                container('kubectl') {
+                container('ctr') {
                     sh '''
-                        # 检查命名空间是否存在
-                        if ! kubectl get namespace ${NAMESPACE}-${APP_NAME} >/dev/null 2>&1; then
-                            echo "Creating namespace ${NAMESPACE}-${APP_NAME}..."
-                            kubectl create namespace ${NAMESPACE}-${APP_NAME}
-                        fi
-
-                        echo "Creating deployment in namespace ${NAMESPACE}-${APP_NAME}..."
+                        # 设置本地镜像名称
+                        LOCAL_IMAGE="localhost/${FULL_IMAGE_NAME}"
                         
-                        # 创建部署配置
+                        echo "Importing image to containerd..."
+                        ctr -n=k8s.io images import --base-name ${LOCAL_IMAGE} "/cache/images/${FULL_IMAGE_NAME}.tar"
+                        
+                        echo "Verifying image in containerd..."
+                        ctr -n=k8s.io images ls | grep ${LOCAL_IMAGE}
+                        
+                        # 获取 MongoDB 服务地址
+                        MONGODB_SERVICE="${RELEASE_NAME}-mongodb.${NAMESPACE}-${APP_NAME}.svc.cluster.local"
+                        
+                        # 检查并删除现有的部署
+                        echo "Checking for existing deployment..."
+                        if kubectl get deployment -n ${NAMESPACE}-${APP_NAME} zkwasm-app-${CUSTOMER_ID}-${APP_NAME} >/dev/null 2>&1; then
+                            echo "Found existing deployment, deleting it..."
+                            kubectl delete deployment -n ${NAMESPACE}-${APP_NAME} zkwasm-app-${CUSTOMER_ID}-${APP_NAME} --timeout=60s
+                            
+                            # 等待旧的 pods 完全终止
+                            echo "Waiting for old pods to terminate..."
+                            kubectl wait --for=delete pod -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -n ${NAMESPACE}-${APP_NAME} --timeout=60s || true
+                        fi
+                        
+                        echo "Creating new deployment..."
                         cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
-  namespace: ${NAMESPACE}-${APP_NAME}
-  labels:
-    app: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
-    version: ${IMAGE_TAG}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
-  template:
-    metadata:
-      labels:
-        app: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
-    spec:
-      containers:
-      - name: app
-        image: ${FULL_IMAGE_NAME}
-        imagePullPolicy: Never  # 使用本地镜像
-        env:
-        - name: URI
-          value: "mongodb://${RELEASE_NAME}-mongodb:27017"
-        - name: REDISHOST
-          value: "${RELEASE_NAME}-redis"
-        - name: MERKLE_SERVER
-          value: "http://${RELEASE_NAME}-merkleservice:3030"
-        ports:
-        - containerPort: 3000
-          name: http
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
+                        apiVersion: apps/v1
+                        kind: Deployment
+                        metadata:
+                          name: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+                          namespace: ${NAMESPACE}-${APP_NAME}
+                          labels:
+                            app: "zkwasm-app-${CUSTOMER_ID}-${APP_NAME}"
+                        spec:
+                          replicas: 1
+                          selector:
+                            matchLabels:
+                              app: "zkwasm-app-${CUSTOMER_ID}-${APP_NAME}"
+                          template:
+                            metadata:
+                              labels:
+                                app: "zkwasm-app-${CUSTOMER_ID}-${APP_NAME}"
+                            spec:
+                              containers:
+                              - name: app
+                                image: ${LOCAL_IMAGE}:latest
+                                imagePullPolicy: Never
+                                env:
+                                - name: NODE_ENV
+                                  value: "production"
+                                - name: URI
+                                  value: "mongodb://${MONGODB_SERVICE}:27017"
+                                - name: REDISHOST
+                                  value: "${RELEASE_NAME}-redis.${NAMESPACE}-${APP_NAME}.svc.cluster.local"
+                                - name: MERKLE_SERVER
+                                  value: "http://${RELEASE_NAME}-merkleservice.${NAMESPACE}-${APP_NAME}.svc.cluster.local:3030"
 EOF
 
-                        echo "Waiting for deployment to be ready..."
-                        kubectl rollout status deployment/zkwasm-app-${CUSTOMER_ID}-${APP_NAME} \
-                            -n ${NAMESPACE}-${APP_NAME} --timeout=5m
+                        echo "Waiting for new pod to be ready..."
+                        kubectl -n ${NAMESPACE}-${APP_NAME} wait --for=condition=ready pod -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} --timeout=300s
+                        
+                        echo "Deployment completed successfully"
                     '''
                 }
             }
@@ -395,20 +452,17 @@ EOF
                         sh '''
                             echo "Deployment failed. Collecting debug information..."
                             
-                            echo "\\nPod Status:"
-                            kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+                            echo "\\nContainerd images:"
+                            ctr -n=k8s.io images ls || true
                             
-                            echo "\\nPod Details:"
-                            kubectl describe pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+                            echo "\\nPod status:"
+                            kubectl get pods -n ${NAMESPACE}-${APP_NAME} -o wide || true
                             
-                            echo "\\nPod Logs:"
-                            for pod in $(kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -o name); do
-                                echo "\\nLogs for $pod:"
-                                kubectl logs $pod -n ${NAMESPACE}-${APP_NAME} --all-containers || true
-                            done
+                            echo "\\nPod description:"
+                            kubectl describe pod -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} || true
                             
-                            echo "\\nEvents:"
-                            kubectl get events -n ${NAMESPACE}-${APP_NAME} --sort-by=.metadata.creationTimestamp
+                            echo "\\nNode status:"
+                            kubectl describe node $(hostname) || true
                         '''
                     }
                 }

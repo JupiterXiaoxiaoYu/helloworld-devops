@@ -1,0 +1,58 @@
+FROM docker.io/library/node:18 as node-builder
+
+# 安装 git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置工作目录并克隆仓库
+WORKDIR /build
+RUN git clone https://github.com/riddles-are-us/helloworld-rollup.git .
+
+# 安装 TypeScript 和其他依赖
+RUN npm install -g typescript && \
+    cd ts && \
+    rm -rf package-lock.json && \
+    npm i --verbose
+
+# Rust 构建阶段
+FROM docker.io/rustlang/rust:nightly-bullseye as rust-builder
+
+# 安装 Rust 构建依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    binaryen \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 wasm-pack
+RUN cargo install wasm-pack --locked
+
+# 设置工作目录并复制代码
+WORKDIR /build
+COPY --from=node-builder /build .
+
+# 构建 Rust WASM
+RUN wasm-pack build --release --out-name application --out-dir pkg && \
+    wasm-opt -Oz -o ts/node_modules/zkwasm-ts-server/src/application/application_bg.wasm pkg/application_bg.wasm && \
+    cp pkg/application_bg.wasm.d.ts ts/node_modules/zkwasm-ts-server/src/application/
+
+# 回到 node-builder 完成 TypeScript 编译
+FROM node-builder as ts-builder
+COPY --from=rust-builder /build/pkg ./pkg
+COPY --from=rust-builder /build/ts/node_modules/zkwasm-ts-server/src/application ./ts/node_modules/zkwasm-ts-server/src/application
+RUN cd ts && npx tsc
+
+# 最终运行阶段
+FROM docker.io/library/node:18-slim
+
+WORKDIR /app
+
+# 只复制需要的文件
+COPY --from=ts-builder /build/ts /app
+
+# 设置环境变量
+ENV URI="" \
+    REDISHOST="" \
+    MERKLE_SERVER=""
+
+EXPOSE 3000
+CMD ["node", "src/service.js"] 
