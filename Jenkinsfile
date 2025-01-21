@@ -455,27 +455,14 @@ pipeline {
             steps {
                 container('kubectl') {
                     sh '''
-                        # Debug information
-                        echo "Current directory: $(pwd)"
-                        echo "WORKSPACE: ${WORKSPACE}"
-                        echo "Directory contents:"
-                        ls -la
-                        echo "Parent directory contents:"
-                        ls -la ..
-                        
                         echo "Creating deployment in namespace ${NAMESPACE}-${APP_NAME}..."
                         
-                        # 清理现有资源
-                        echo "Cleaning up existing resources..."
-                        kubectl delete deployment zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -n ${NAMESPACE}-${APP_NAME} --ignore-not-found=true
-                        kubectl delete pod workspace-copy -n ${NAMESPACE}-${APP_NAME} --ignore-not-found=true
+                        # 获取当前运行的测试 pod 信息
+                        TEST_POD_NAME=$(kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l jenkins/jenkins-jenkins-agent -o jsonpath='{.items[0].metadata.name}')
+                        echo "Found test pod: ${TEST_POD_NAME}"
                         
-                        # 创建 ConfigMap 来存储文件
-                        echo "Creating ConfigMap from ts directory..."
-                        kubectl create configmap app-files -n ${NAMESPACE}-${APP_NAME} \
-                            --from-file=./ts || true
-                        
-                        echo "Creating deployment..."
+                        # 创建部署配置
+                        echo "Creating deployment from test pod..."
                         cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -494,22 +481,6 @@ spec:
       labels:
         app: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
     spec:
-      initContainers:
-      - name: copy-files
-        image: node:18-slim
-        command: 
-        - /bin/sh
-        - -c
-        - |
-          echo "Copying files to app directory..."
-          cp -rv /config/* /app/
-          echo "App directory contents:"
-          ls -la /app
-        volumeMounts:
-        - name: app-files
-          mountPath: /app
-        - name: config-volume
-          mountPath: /config
       containers:
       - name: app
         image: node:18-slim
@@ -544,11 +515,32 @@ spec:
       volumes:
       - name: app-files
         emptyDir: {}
-      - name: config-volume
-        configMap:
-          name: app-files
+      initContainers:
+      - name: copy-files
+        image: node:18-slim
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Copying files from test pod..."
+          cp -rv /source/ts/. /app/
+          cd /app
+          echo "Installing dependencies..."
+          npm ci --verbose
+        volumeMounts:
+        - name: app-files
+          mountPath: /app
+        - name: test-files
+          mountPath: /source
+      volumes:
+      - name: app-files
+        emptyDir: {}
+      - name: test-files
+        hostPath:
+          path: ${WORKSPACE}
+          type: Directory
 EOF
-
+                        
                         echo "Waiting for deployment to be ready..."
                         kubectl rollout status deployment/zkwasm-app-${CUSTOMER_ID}-${APP_NAME} \
                             -n ${NAMESPACE}-${APP_NAME} --timeout=5m || true
@@ -561,6 +553,23 @@ EOF
                         kubectl logs ${POD_NAME} -c copy-files -n ${NAMESPACE}-${APP_NAME} || true
                         echo "App container logs:"
                         kubectl logs ${POD_NAME} -c app -n ${NAMESPACE}-${APP_NAME} || true
+                        
+                        # 创建服务
+                        echo "Creating service..."
+                        cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+  namespace: ${NAMESPACE}-${APP_NAME}
+spec:
+  selector:
+    app: zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+  ports:
+  - name: http
+    port: 3000
+    targetPort: http
+EOF
                     '''
                 }
             }
