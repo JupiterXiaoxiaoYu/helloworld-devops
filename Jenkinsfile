@@ -80,11 +80,21 @@ pipeline {
         APP_NAME = "${params.APP_NAME}"
         MINIROLLUP_CHARTS_REPO = "${params.MINIROLLUP_CHARTS_REPO}"
         RELEASE_NAME = "zkwasm-mini-rollup-${CUSTOMER_ID}-${APP_NAME}"
+        SERVER_ADMIN_KEY = "${params.SERVER_ADMIN_KEY}"
+        DEPLOY = "${params.DEPLOY}"
+        REMOTE = "${params.REMOTE}"
+        MIGRATE = "${params.MIGRATE}"
+        TASKID = "${params.TASKID}"
+        IMAGE = "${params.IMAGE}"
+        SETTLEMENT_CONTRACT_ADDRESS = "${params.SETTLEMENT_CONTRACT_ADDRESS}"
+        USER_ADDRESS = "${params.USER_ADDRESS}"
+        USER_PRIVATE_ACCOUNT = "${params.USER_PRIVATE_ACCOUNT}"
+        SETTLER_PRIVATE_ACCOUNT = "${params.SETTLER_PRIVATE_ACCOUNT}"
     }
 
     stages {
 
-        stage('Deploy to K8s') {
+        stage('Deploy Mini Rollup to K8s') {
             options {
                 timeout(time: 15, unit: 'MINUTES')
             }
@@ -282,7 +292,7 @@ pipeline {
         }
 
 
-        stage('Build Image') {
+        stage('Build Application Image') {
             steps {
                 container('buildah') {
                     sh '''
@@ -378,18 +388,32 @@ EOF
             }
         }
 
-        stage('Deploy') {
+        stage('Deploy Application to K8s') {
             steps {
                 container('ctr') {
                     sh '''
                         # 设置本地镜像名称
                         LOCAL_IMAGE="localhost/${FULL_IMAGE_NAME}"
                         
-                        echo "Importing image to containerd..."
-                        ctr -n=k8s.io images import --base-name ${LOCAL_IMAGE} "/cache/images/${FULL_IMAGE_NAME}.tar"
+                        # 检查镜像文件是否存在
+                        if [ ! -f "/cache/images/${FULL_IMAGE_NAME}.tar" ]; then
+                            echo "Error: Image file not found: /cache/images/${FULL_IMAGE_NAME}.tar"
+                            exit 1
+                        fi
                         
-                        echo "Verifying image in containerd..."
-                        ctr -n=k8s.io images ls | grep ${LOCAL_IMAGE}
+                        echo "Checking existing image in containerd..."
+                        if ! ctr -n=k8s.io images ls | grep -q ${LOCAL_IMAGE}; then
+                            echo "Importing image to containerd..."
+                            ctr -n=k8s.io images import --base-name ${LOCAL_IMAGE} "/cache/images/${FULL_IMAGE_NAME}.tar"
+                            
+                            echo "Verifying image import..."
+                            if ! ctr -n=k8s.io images ls | grep -q ${LOCAL_IMAGE}; then
+                                echo "Error: Failed to import image to containerd"
+                                exit 1
+                            fi
+                        else
+                            echo "Image already exists in containerd"
+                        fi
                         
                         # 获取 MongoDB 服务地址
                         MONGODB_SERVICE="${RELEASE_NAME}-mongodb.${NAMESPACE}-${APP_NAME}.svc.cluster.local"
@@ -400,7 +424,6 @@ EOF
                             echo "Found existing deployment, deleting it..."
                             kubectl delete deployment -n ${NAMESPACE}-${APP_NAME} zkwasm-app-${CUSTOMER_ID}-${APP_NAME} --timeout=60s
                             
-                            # 等待旧的 pods 完全终止
                             echo "Waiting for old pods to terminate..."
                             kubectl wait --for=delete pod -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -n ${NAMESPACE}-${APP_NAME} --timeout=60s || true
                         fi
@@ -437,11 +460,60 @@ EOF
                                   value: "${RELEASE_NAME}-redis.${NAMESPACE}-${APP_NAME}.svc.cluster.local"
                                 - name: MERKLE_SERVER
                                   value: "http://${RELEASE_NAME}-merkleservice.${NAMESPACE}-${APP_NAME}.svc.cluster.local:3030"
+                                - name: SERVER_ADMIN_KEY
+                                  value: "${SERVER_ADMIN_KEY}"
+                                - name: DEPLOY
+                                  value: "${DEPLOY}"
+                                - name: REMOTE
+                                  value: "${REMOTE}"
+                                - name: MIGRATE
+                                  value: "${MIGRATE}"
+                                - name: TASKID
+                                  value: "${TASKID}"
+                                - name: IMAGE
+                                  value: "${IMAGE}"
+                                - name: SETTLEMENT_CONTRACT_ADDRESS
+                                  value: "${SETTLEMENT_CONTRACT_ADDRESS}"
+                                - name: USER_ADDRESS
+                                  value: "${USER_ADDRESS}"
+                                - name: USER_PRIVATE_ACCOUNT
+                                  value: "${USER_PRIVATE_ACCOUNT}"
+                                - name: SETTLER_PRIVATE_ACCOUNT
+                                  value: "${SETTLER_PRIVATE_ACCOUNT}"
 EOF
 
-                        echo "Waiting for new pod to be ready..."
-                        kubectl -n ${NAMESPACE}-${APP_NAME} wait --for=condition=ready pod -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} --timeout=300s
-                        
+                        echo "Waiting for pod creation and readiness..."
+                        for i in $(seq 1 60); do  # 增加重试次数和总等待时间
+                            # 检查是否有 ErrImageNeverPull 状态的 pod
+                            if kubectl get pod -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} 2>/dev/null | grep -q ErrImageNeverPull; then
+                                echo "Found pod with ErrImageNeverPull status, deleting it..."
+                                kubectl delete pod -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+                                echo "Waiting for pod recreation..."
+                                sleep 5
+                                continue
+                            fi
+                            
+                            # 检查 pod 是否创建和就绪
+                            if kubectl get pod -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} 2>/dev/null | grep -q .; then
+                                echo "Pod found, waiting for ready state..."
+                                if kubectl -n ${NAMESPACE}-${APP_NAME} wait --for=condition=ready pod -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} --timeout=10s; then
+                                    echo "Pod is ready!"
+                                    break
+                                fi
+                            fi
+                            echo "Attempt ${i}/60: Waiting for pod..."
+                            sleep 2
+                        done
+
+                        # 验证最终状态
+                        POD_STATUS=$(kubectl get pod -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -o jsonpath='{.items[0].status.phase}')
+                        if [ "$POD_STATUS" != "Running" ]; then
+                            echo "Pod failed to become ready. Current status:"
+                            kubectl get pods -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME} -o wide
+                            kubectl describe pod -n ${NAMESPACE}-${APP_NAME} -l app=zkwasm-app-${CUSTOMER_ID}-${APP_NAME}
+                            exit 1
+                        fi
+
                         echo "Deployment completed successfully"
                     '''
                 }
